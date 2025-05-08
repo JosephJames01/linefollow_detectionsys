@@ -117,15 +117,6 @@ class ObjectDetection:
                 # Delete the processed image to wait for a new one
                 os.remove(image_path)
 
-                    
-                 
-              
-
-                # Calculate the average confidence score
-                
-                
-
-        # After exiting the loop, delete all files in the directory
         
 
         cv2.destroyAllWindows()
