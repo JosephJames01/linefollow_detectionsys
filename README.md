@@ -7,3 +7,5 @@ its own position and adjust its x, y coordinates appropriately and with very hig
 
 The system can then capture and report inventory data at defined positions within an environment using visual cues and further computer vision techniques. This gives the user accurate,
 consistent insight of their available inventory without the need for expensive detection tech such as bardcode scanning.
+
+To see a full presentation of the project in action please see this video https://www.youtube.com/watch?v=drLWpMeTv8o 
