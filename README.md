@@ -1,237 +1,235 @@
-# 🤖 Autonomous Robot for Inventory Monitoring within SMEs
+# 🤖 Autonomous Robot for Inventory Monitoring in SMEs
 
-A low-cost autonomous mobile robot for **real-time inventory monitoring** in small and medium-sized enterprises (SMEs). The system fuses a custom-trained **YOLOv8** object detector with a **classical computer-vision signal-extraction pipeline** and a **Ziegler–Nichols-tuned PID controller**, all orchestrated as modular **ROS nodes** on a TurtleBot3-style platform.
+A low-cost autonomous mobile robot that follows a line around a workspace, stops at fixed positions, and counts stock with a custom-trained **YOLOv8n** model — no RFID, barcodes or QR codes required.
 
-The line-following controller achieves **< 5% overshoot** and a **settling time under 1 s**, and the detection stack reports stock levels with **no RFID or barcode hardware** required.
+Built on a **TurtleBot3 Burger** with a USB webcam and **ROS Noetic**. Total hardware cost: **under £1,000**.
 
 📹 **Full walkthrough & live demo:** https://www.youtube.com/watch?v=drLWpMeTv8o
 
+> Undergraduate thesis project — BEng Robotics Engineering, Cardiff Metropolitan University, 2024.
+
 ---
 
-## Pipeline at a glance
+## How it works
 
 ```mermaid
 flowchart LR
-    CAM["Camera node<br/>/image_raw"] --> VIS["Vision node<br/>signal extraction"]
-    VIS -- "cross-track error e(t)" --> CTRL["Control node<br/>PID"]
-    CTRL -- "/cmd_vel (Twist)" --> BOT["TurtleBot3 base"]
-    CAM --> DET["Detection node<br/>YOLOv8"]
-    DET -- "stock counts" --> REP["Inventory report"]
+    CAM["usb_cam node<br/>/usb_cam/image_raw/compressed"] --> RC["robot_controller node<br/>line detection + PID"]
+    RC -->|"/cmd_vel (Twist)"| CORE["turtlebot3_core<br/>motors"]
+    RC -->|"frame saved at each position"| FOLDER["results/"]
+    FOLDER --> DET["detection script<br/>YOLOv8n"]
+    DET --> OUT["annotated images<br/>+ stock counts"]
 ```
 
-The robot follows a coloured floor line, continuously regressing a single steering signal from the camera stream; at predefined waypoints it stops and runs object detection to log inventory.
+1. The robot follows a **black line** on the floor, using only the bottom quarter of the camera frame.
+2. When it sees a **wide horizontal line across its path**, it treats that as a stocktake position: it stops, turns to face the shelf, saves a frame, turns back, and carries on.
+3. A separate detection script watches the image folder, runs **YOLOv8n** on each new frame, and prints how many items were found at each position plus running totals.
+
+**Approach.** This was an experimental build rather than a theory-first one. The processing steps were taken from published line-following and vision-navigation papers (Gaussian blur → HSV thresholding → morphology → contours for detection, PID for steering), then tuned and validated on the real robot.
 
 ---
 
-## 1. Vision as a Signal-Extraction Pipeline
+## 1. Line detection
 
-Each camera frame is a discrete 2-D, 3-channel signal
+A standard OpenCV pipeline, run on every incoming frame.
 
-$$
-I_0:\Omega\to\mathbb{Z}^3,\qquad \Omega=\{0,\dots,W-1\}\times\{0,\dots,H-1\},\qquad I_0(x,y)=[B,G,R]^\top .
-$$
+| Step | Code | Why |
+|------|------|-----|
+| 1. Crop to bottom quarter | `frame[int(3*height/4):, :]` | Only the floor directly ahead matters. Drops ~75% of the pixels, which keeps the loop fast. |
+| 2. Gaussian blur, 5×5 | `cv2.GaussianBlur(img, (5,5), 0)` | Smooths sensor noise and floor texture *before* thresholding, so grain doesn't get frozen into the mask. Small kernel keeps the line edges sharp. |
+| 3. Convert to HSV | `cv2.cvtColor(..., COLOR_BGR2HSV)` | Separates colour from brightness, so one fixed threshold survives different lighting. |
+| 4. Threshold for black | `cv2.inRange(hsv, (0,0,0), (180,255,100))` | Keeps any pixel with brightness below 100 at any hue → a binary mask of the line. |
+| 5. Morphological closing, 5×5 | `cv2.morphologyEx(mask, MORPH_CLOSE, k)` | Fills pinholes and small gaps so the line stays one continuous shape instead of breaking up. |
+| 6. Find contours | `cv2.findContours(...)` | Turns the mask into candidate shapes. |
+| 7. Filter by size | keep contours where `w*h > 1600` px | Discards speckle and small dark objects on the floor. |
+| 8. Take the largest contour | `cv2.boundingRect(...)` | That box is the line. |
 
-We model it as a clean line component $S$ corrupted by additive and impulsive noise (motion blur, uneven lighting, specular highlights, sensor grain):
+**The steering error** is then just one number:
 
-$$
-I_0(x,y)=S(x,y)+N(x,y).
-$$
+```python
+error = (frame_width / 2) - (box_x + box_w / 2)
+```
 
-The goal is to **demodulate** this high-dimensional, noisy field into one robust scalar — the steering error $e$ — through a composition of operators in which each stage's output is the conditioned input to the next:
-
-$$
-e=\bigl(\mathcal{T}_M\circ\mathcal{T}_W\circ\mathcal{T}_O\circ\mathcal{T}_\Theta\circ\mathcal{T}_G\circ\mathcal{T}_{\mathrm{HSV}}\bigr)(I_0).
-$$
-
-### Stage 1 — HSV colour-space transform
-
-With normalised channels $R',G',B'\in[0,1]$ and $C_{\max}=\max(R',G',B')$, $C_{\min}=\min(R',G',B')$, $\Delta=C_{\max}-C_{\min}$:
-
-$$
-V=C_{\max},\qquad
-S=\begin{cases}\Delta/C_{\max}, & C_{\max}\neq 0\\ 0,& \text{otherwise}\end{cases},\qquad
-H=60^\circ\times
-\begin{cases}
-0, & \Delta=0\\
-\frac{G'-B'}{\Delta}\bmod 6, & C_{\max}=R'\\
-\frac{B'-R'}{\Delta}+2, & C_{\max}=G'\\
-\frac{R'-G'}{\Delta}+4, & C_{\max}=B'.
-\end{cases}
-$$
-
-**Why it feeds forward:** projecting BGR onto HSV decorrelates *chroma* $(H,S)$ from *luminance* $(V)$. The line then occupies a compact, illumination-invariant region of feature space, so the downstream threshold can be a fixed band that survives shadows and glare.
-
-### Stage 2 — Gaussian low-pass filter
-
-$$
-I_2 = I_1 * G_\sigma,\qquad G_\sigma(x,y)=\frac{1}{2\pi\sigma^2}\,\exp\!\left(-\frac{x^2+y^2}{2\sigma^2}\right).
-$$
-
-**Why it feeds forward:** convolution with $G_\sigma$ attenuates the high-frequency band where noise $N$ concentrates, raising SNR *before* the nonlinear threshold. Smoothing first prevents isolated noise spikes from being quantised into the binary mask, where a linear filter could no longer remove them.
-
-### Stage 3 — Threshold / colour masking
-
-$$
-B(x,y)=\prod_{c\in\{H,S,V\}}\mathbf{1}\!\left[\theta_c^{-}\le I_2^{c}(x,y)\le\theta_c^{+}\right]\in\{0,1\}.
-$$
-
-This is the `cv2.inRange` mask using the HSV bounds $\theta_c^{\pm}$ from the design document — a matched segmenter that keeps only pixels inside the line's colour band.
-
-**Why it feeds forward:** because Stages 1–2 made the band compact and noise-suppressed, the indicator collapses three channels to a clean 1-bit-per-pixel field — the exact representation the morphological and moment operators expect.
-
-### Stage 4 — Morphological opening
-
-With structuring element $K$, opening is an erosion followed by a dilation:
-
-$$
-(B\ominus K)(x,y)=\min_{(i,j)\in K}B(x-i,\,y-j),\qquad
-(B\oplus K)(x,y)=\max_{(i,j)\in K}B(x-i,\,y-j),
-$$
-
-$$
-B_4=(B\ominus K)\oplus K.
-$$
-
-**Why it feeds forward:** opening is a rank filter that removes any connected component smaller than $K$ — the residual speckle that survived thresholding — while restoring line width and closing pinholes, guaranteeing the next stage integrates over a single coherent blob.
-
-### Stage 5 — Region-of-interest gating
-
-$$
-B_5(x,y)=B_4(x,y)\,w(x,y),\qquad w(x,y)=\mathbf{1}\!\left[y\ge y_0\right].
-$$
-
-**Why it feeds forward:** windowing to the look-ahead band directly in front of the robot rejects far-field and off-path energy, minimising phase lag so the error reflects where the robot is *about to be* — directly improving settling time and stability.
-
-### Stage 6 — Image-moment estimation
-
-$$
-M_{pq}=\sum_{x}\sum_{y}x^{p}y^{q}\,B_5(x,y),\qquad
-c_x=\frac{M_{10}}{M_{00}},\qquad c_y=\frac{M_{01}}{M_{00}}.
-$$
-
-**Why it feeds forward:** the centroid is a maximum-likelihood location estimate under zero-mean pixel noise. If each inlier pixel has noise variance $\sigma_n^2$, the centroid variance scales as
-
-$$
-\mathrm{Var}(c_x)\approx\frac{\sigma_n^2}{M_{00}},
-$$
-
-so integrating over the $M_{00}$ line pixels suppresses residual noise by a factor of $\sqrt{M_{00}}$, collapsing the 2-D field to one high-SNR scalar.
-
-### Output — the control error
-
-$$
-e(t)=c_x-\frac{W}{2}.
-$$
-
-The **cross-track error** is the centroid's deviation from the optical centre — the single feature handed to the controller.
-
-### Why the cascade performs well
-
-Each operator is chosen so its output lands in the ideal input domain of the next, producing two monotonic trends:
-
-- **SNR increases** — HSV isolates the band, Gaussian filtering removes additive noise, opening removes impulsive noise, and moment integration averages out the remainder. Noise is attacked by linear, nonlinear, and statistical means in turn, so it never accumulates.
-- **Dimensionality decreases** — $\mathbb{Z}^3 \to \{0,1\} \to \mathbb{R}$. Information irrelevant to steering is discarded early and cheaply, keeping per-frame latency low.
-
-Ordering is deliberate: smoothing *before* thresholding stops noise being frozen into the mask; opening *before* moments guarantees a single region to integrate; gating *before* the centroid removes lag-inducing far-field data. The result is a clean, low-latency, high-SNR error signal — a well-conditioned input for the PID controller.
+In plain terms: *how many pixels left or right of the image centre the line is sitting.* Zero means dead centre, positive means the line is off to one side, negative to the other. That single value is the only thing the controller needs.
 
 ---
 
-## 2. Control — Ziegler–Nichols-Tuned PID
+## 2. Line following — PID
 
-The error $e(t)$ drives a PID controller that commands angular velocity, steering the centroid back to the image centre:
+The error drives a PID controller (via the `simple_pid` library) which outputs an angular velocity to steer the line back to the centre of the frame:
 
-$$
-u(t)=K_p\,e(t)+K_i\!\int_0^{t}\!e(\tau)\,d\tau+K_d\,\frac{d e(t)}{dt}.
-$$
+```
+u(t) = Kp·e(t) + Ki·∫e(t)dt + Kd·de(t)/dt
+```
 
-Discretised at the camera frame period $\Delta t$:
+- `u` is published as `angular.z` in a ROS `Twist` message
+- forward speed `linear.x` is held constant at 0.1 m/s
+- the loop runs at 10 Hz
 
-$$
-u_k=K_p\,e_k+K_i\sum_{j=0}^{k}e_j\,\Delta t+K_d\,\frac{e_k-e_{k-1}}{\Delta t}.
-$$
+| Parameter | Value |
+|-----------|-------|
+| `Kp` | 0.003 |
+| `Ki` | 0.0035 |
+| `Kd` | 0.0006 |
+| Output limits | ±0.2 rad/s |
+| Forward speed | 0.1 m/s |
+| Loop rate | 10 Hz |
 
-$u_k$ is published as the angular term `angular.z` of a ROS `Twist`, while a constant forward velocity `linear.x` is held.
+Output is clamped to ±0.2 rad/s so a large error can't make the robot spin on the spot.
 
-**Tuning (ultimate-gain method).** With $K_i=K_d=0$, raise the proportional gain until the loop sustains stable oscillation at ultimate gain $K_u$ and period $T_u$; the classic PID gains then follow:
+**Tuning (Ziegler–Nichols, done on the robot).**
 
-| Gain | Formula |
-|------|---------|
-| $K_p$ | $0.6\,K_u$ |
-| $K_i$ | $1.2\,K_u/T_u$ |
-| $K_d$ | $0.075\,K_u T_u$ |
-
-equivalently $T_i=0.5\,T_u$ and $T_d=0.125\,T_u$. Step and trajectory responses were modelled in **Matplotlib** to confirm **< 5% overshoot** and **< 1 s settling time** before deployment.
-
----
-
-## 3. Inventory Detection — Custom YOLOv8
-
-At waypoints (triggered by a change in line colour) the robot stops and runs a **custom YOLOv8** model trained on warehouse stock imagery. YOLOv8 is a single-pass CNN that jointly regresses bounding boxes and class probabilities, post-processed with confidence thresholding and **Non-Maximum Suppression** driven by **Intersection-over-Union**:
-
-$$
-\mathrm{IoU}(A,B)=\frac{|A\cap B|}{|A\cup B|}.
-$$
-
-Detection quality is reported as mean Average Precision,
-
-$$
-\mathrm{mAP}=\frac{1}{|C|}\sum_{c\in C}\int_0^{1} p_c(r)\,dr,
-$$
-
-with the nano variant delivering real-time inference at roughly **33% higher mAP than YOLOv5n** — ideal for low-cost, on-robot deployment. This gives SMEs accurate, consistent stock insight **without RFID or barcode hardware**, and without the line-of-sight and printing constraints of QR codes.
+1. Set `Ki = Kd = 0` and raised `Kp` until the robot oscillated steadily around the line. That happened at **`Kp` ≈ 0.005** — the critical gain.
+2. Applied the classic Ziegler–Nichols ratios to that gain to get the three values above.
+3. Confirmed the result on the robot and from logged error-vs-time plots (Matplotlib).
 
 ---
 
-## 4. ROS Architecture
+## 3. Position trigger and the stop–turn–capture sequence
 
-| Node | Subscribes | Publishes | Role |
-|------|------------|-----------|------|
-| `camera_node` | — | `/image_raw` | Streams frames |
-| `vision_node` | `/image_raw` | `/line_error` | Runs the Stage 1–6 cascade |
-| `control_node` | `/line_error` | `/cmd_vel` | Ziegler–Nichols PID |
-| `detection_node` | `/image_raw` | `/inventory` | YOLOv8 stock counting |
+A stocktake position is marked by a second line laid **across** the path. It's detected when the contour is both wide and large:
 
-Decoupling perception, control, and detection into independent nodes keeps the system modular, testable, and portable across platforms.
+```python
+if aspect_ratio > 5 and w * h > 20000:   # wide and big = a marker, not the path
+```
+
+A normally followed line never satisfies both conditions, which is what keeps false triggers out. Once triggered:
+
+1. Stop line following
+2. Turn at `+0.3 rad/s` for 4.5 s → faces the shelf
+3. Hold for ~5 s, then save the frame to `results/outputposition<N>.jpg`
+4. Turn at `-0.3 rad/s` for 4.5 s → back onto the path
+5. Drive forward at 0.1 m/s for 1 s to clear the marker
+6. Reset the trigger and resume line following
 
 ---
 
-## Repository Structure
+## 4. Inventory detection — custom YOLOv8n
+
+A standalone Python script rather than a ROS node, which keeps the inference load off the control loop and lets it run on any machine.
+
+- **Model:** YOLOv8n, custom trained, single class `mug` (standing in for stock)
+- **Dataset:** 709 source images → **1,779 after augmentation** (1.5 px blur, ±10% brightness), split 90% train / 8% validation / 2% test
+- **Training:** 100 epochs on a Tesla T4 in Google Colab
+- **Runtime:** CPU inference, confidence threshold **0.85**, annotated images written to `positions/`
+- **Output:** per-position item count and confidence, plus running totals of positions and items, printed to the terminal
+
+The script polls `results/`, runs the model on each new frame, writes the annotated version, then deletes the source image so it's ready for the next position.
+
+**Why YOLOv8n:** it's the smallest YOLOv8 variant, fast enough for CPU-only inference, and benchmarks higher than earlier nano models — the right trade-off for low-cost hardware.
+
+---
+
+## System architecture
+
+| Node / script | Runs on | Subscribes | Publishes | Role |
+|---------------|---------|------------|-----------|------|
+| `usb_cam` | TurtleBot3 | — | `/usb_cam/image_raw/compressed` | Streams webcam frames |
+| `robot_controller` | PC | `/usb_cam/image_raw/compressed` | `cmd_vel` | Line detection, PID steering, stop–turn–capture, saves position images |
+| `turtlebot3_core` | TurtleBot3 | `cmd_vel` | odometry / sensor topics | Drives the Dynamixel motors |
+| `object_detection.py` | Any machine | watches `results/` | writes `positions/` + terminal report | YOLOv8n stock counting |
+
+Package: `linefollow_detectionsys`. The ROS master runs on the PC; the camera and motor nodes run on the robot.
+
+---
+
+## Hardware
+
+| Part | Detail |
+|------|--------|
+| Platform | TurtleBot3 Burger (~£700) |
+| On-board compute | Raspberry Pi 3 Model B — Ubuntu 20.04, ROS Noetic |
+| Motor control | OpenCR board (STM32F7) + 2× XL430-W250 Dynamixel |
+| Camera | Advent 1080p USB webcam |
+| Power | 11 V LiPo |
+| Off-board | Ubuntu laptop running the ROS master, control node and detection script |
+
+---
+
+## Repository structure
 
 ```
 .
 ├── src/
-│   ├── vision_node/          # HSV → mask → opening → ROI → moments
-│   ├── control_node/         # Ziegler–Nichols PID
-│   └── detection_node/       # YOLOv8 inference + reporting
-├── models/                   # trained YOLOv8 weights
+│   ├── robot_controller.py   # line detection + PID + stop-turn-capture (ROS node)
+│   └── object_detection.py   # YOLOv8n inference + reporting (standalone)
+├── models/
+│   └── best.pt               # trained YOLOv8n weights
+├── results/                  # frames captured at each position (detector input)
+├── positions/                # annotated detection output
 ├── launch/                   # ROS launch files
-├── analysis/                 # Matplotlib step-response / tuning notebooks
+├── package.xml
 └── README.md
 ```
 
-## Getting Started
+---
+
+## Getting started
 
 ```bash
-# 1. clone
-git clone https://github.com/<you>/inventory-robot.git
-cd inventory-robot
+# On the TurtleBot3
+roslaunch turtlebot3_bringup turtlebot3_robot.launch
+roslaunch usb_cam usb_cam-test.launch
 
-# 2. build the workspace
-catkin_make && source devel/setup.bash
+# On the PC (ROS master)
+roscore
+rosrun linefollow_detectionsys robot_controller.py
 
-# 3. launch the full stack
-roslaunch launch/inventory_robot.launch
+# In a second terminal on the PC
+python3 src/object_detection.py
 ```
 
-## Results
-
-| Metric | Target | Achieved |
-|--------|--------|----------|
-| Overshoot | < 5% | ✅ |
-| Settling time | < 1 s | ✅ |
-| Inventory detection | real-time | ✅ YOLOv8-nano |
-| Detection hardware | none | ✅ camera-only |
+Requires ROS Noetic, OpenCV, `cv_bridge`, `simple-pid`, `ultralytics` and `numpy`.
 
 ---
 
-*Built on TurtleBot3, ROS, OpenCV, Ultralytics YOLOv8, and Matplotlib.*
+## Results
+
+Every test below was run for 10 iterations.
+
+**Line detection** — 3 backgrounds (white, dark grey textured, grey with spots) × 3 lighting conditions (standard, directly under a light, away from the light):
+
+| Test | Result |
+|------|--------|
+| Line detected at standstill | 10/10 in all 9 combinations |
+| Line held while following | 10/10 in all 9 combinations |
+| False positive from a small black object in frame | 0/10 in all 9 combinations |
+
+**Line following (PID):**
+
+| Metric | Result |
+|--------|--------|
+| Steady-state error, starting centred | ≈ ±15 px |
+| Overshoot from a 182 px starting error | 72 px (39%) |
+| Settling time from a 182 px starting error | ≈ 2.3 s |
+
+An error that large only occurs on very tight curves. From a near-centred start the robot tracks the line smoothly, with minor oscillation only after tight bends.
+
+**Object detection (validation set):**
+
+| Metric | Score |
+|--------|-------|
+| mAP@50 | 0.982 |
+| Precision | 0.92 |
+| Recall | 0.94 |
+| "Extreme" (blurred / distorted) test images | 10/10 detected, all > 0.8 confidence |
+
+**Position trigger:** correctly fired on every wide across-path marker and never fired on small or low-aspect-ratio lines.
+
+**Integration:** 10 full runs of a 4-position course — an image was captured, analysed and reported at every position, 4/4 every run.
+
+---
+
+## Known limitations and next steps
+
+- **Turns are open loop.** The 90° turns are timed (4.5 s at 0.3 rad/s) rather than closed on odometry, so battery voltage and floor friction change the actual angle. Closing the loop on `/odom` would make it repeatable.
+- **Tight curves are the weak point.** Overshoot grows with error, so fast tight bends are where accuracy drops. Gain scheduling, or reducing `linear.x` when `|error|` is large, would help.
+- **Detection handoff uses the filesystem** (`results/` → `positions/`) rather than a ROS topic. Simple and it works, but publishing to an `/inventory` topic would remove the polling delay and make the system properly modular.
+- **Error is read from the wrong contour.** `x` and `w` are taken from the last contour that passed the size filter rather than from `largest_contour`. Identical whenever only one contour survives, but it should read from the largest box.
+- **`self.stop` is called without `()`** in a couple of places, so the explicit stop never actually executes. Harmless in practice because the next velocity command overwrites it, but worth fixing.
+- **Single class.** `mug` is a stand-in for stock. More classes, plus an expected count per shelf, would turn this from item counting into a real inventory check.
+
+---
+
+Built with TurtleBot3, ROS Noetic, OpenCV, simple-pid, Ultralytics YOLOv8 and Matplotlib.
+
